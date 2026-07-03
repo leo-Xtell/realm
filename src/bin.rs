@@ -2,7 +2,7 @@ use std::env;
 use cfg_if::cfg_if;
 
 use realm::cmd;
-use realm::conf::{Config, FullConf, LogConf, DnsConf, EndpointInfo};
+use realm::conf::{Config, FullConf, LogConf, DnsConf, EndpointConf, EndpointInfo, CmdOverride};
 use realm::ENV_CONFIG;
 
 cfg_if! {
@@ -21,11 +21,29 @@ cfg_if! {
     }
 }
 
+struct ReloadCtx {
+    path: String,
+    opts: CmdOverride,
+}
+
+impl ReloadCtx {
+    fn reload(&self) -> FullConf {
+        let mut conf = FullConf::from_conf_file(&self.path);
+        conf.apply_global_opts().apply_cmd_opts(self.opts.clone());
+        conf
+    }
+}
+
+enum Action {
+    Reload,
+    Shutdown,
+}
+
 fn main() {
-    let conf = 'blk: {
+    let (conf, reload) = 'blk: {
         if let Ok(conf_str) = env::var(ENV_CONFIG) {
             if let Ok(conf) = FullConf::from_conf_str(&conf_str) {
-                break 'blk conf;
+                break 'blk (conf, None);
             }
         };
 
@@ -34,21 +52,21 @@ fn main() {
             CmdInput::Endpoint(ep, opts) => {
                 let mut conf = FullConf::default();
                 conf.add_endpoint(ep).apply_global_opts().apply_cmd_opts(opts);
-                conf
+                (conf, None)
             }
-            CmdInput::Config(conf, opts) => {
-                let mut conf = FullConf::from_conf_file(&conf);
-                conf.apply_global_opts().apply_cmd_opts(opts);
-                conf
+            CmdInput::Config(path, opts) => {
+                let mut conf = FullConf::from_conf_file(&path);
+                conf.apply_global_opts().apply_cmd_opts(opts.clone());
+                (conf, Some(ReloadCtx { path, opts }))
             }
             CmdInput::None => std::process::exit(0),
         }
     };
 
-    start_from_conf(conf);
+    start_from_conf(conf, reload);
 }
 
-fn start_from_conf(full: FullConf) {
+fn start_from_conf(full: FullConf, reload: Option<ReloadCtx>) {
     let FullConf {
         log: log_conf,
         dns: dns_conf,
@@ -60,13 +78,28 @@ fn start_from_conf(full: FullConf) {
     setup_dns(dns_conf);
     setup_transport();
 
-    let endpoints: Vec<EndpointInfo> = endpoints_conf
-        .into_iter()
-        .map(Config::build)
-        .inspect(|x| println!("inited: {}", x.endpoint))
-        .collect();
+    supervise(endpoints_conf, reload);
+}
 
-    execute(endpoints);
+fn supervise(mut endpoints_conf: Vec<EndpointConf>, reload: Option<ReloadCtx>) {
+    loop {
+        let endpoints: Vec<EndpointInfo> = endpoints_conf
+            .into_iter()
+            .map(Config::build)
+            .inspect(|x| println!("inited: {}", x.endpoint))
+            .collect();
+
+        let action = execute(endpoints, reload.is_some());
+
+        match action {
+            Action::Reload => {
+                let ctx = reload.as_ref().unwrap();
+                println!("reload: {}", &ctx.path);
+                endpoints_conf = ctx.reload().endpoints;
+            }
+            Action::Shutdown => break,
+        }
+    }
 }
 
 fn setup_log(log: LogConf) {
@@ -103,27 +136,27 @@ fn setup_transport() {
     }
 }
 
-fn execute(eps: Vec<EndpointInfo>) {
-    #[cfg(feature = "multi-thread")]
-    {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(run(eps))
+fn execute(eps: Vec<EndpointInfo>, reloadable: bool) -> Action {
+    cfg_if! {
+        if #[cfg(feature = "multi-thread")] {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        } else {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+        }
     }
 
-    #[cfg(not(feature = "multi-thread"))]
-    {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(run(eps))
-    }
+    let action = rt.block_on(serve(eps, reloadable));
+    rt.shutdown_timeout(std::time::Duration::ZERO);
+    action
 }
 
-async fn run(endpoints: Vec<EndpointInfo>) {
+async fn serve(endpoints: Vec<EndpointInfo>, reloadable: bool) -> Action {
     use realm::core::tcp::run_tcp;
     use realm::core::udp::run_udp;
     use futures::future::join_all;
@@ -147,5 +180,23 @@ async fn run(endpoints: Vec<EndpointInfo>) {
 
     workers.shrink_to_fit();
 
-    join_all(workers).await;
+    if reloadable {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut hangup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+            tokio::select! {
+                _ = join_all(workers) => Action::Shutdown,
+                _ = hangup.recv() => Action::Reload,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            join_all(workers).await;
+            Action::Shutdown
+        }
+    } else {
+        join_all(workers).await;
+        Action::Shutdown
+    }
 }

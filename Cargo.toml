@@ -34,7 +34,7 @@ futures = "0.3"
 walkdir = "2"
 
 # runtime
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "signal", "macros"] }
 
 # logger
 log = "0.4"
@@ -58,6 +58,7 @@ mmap-allocator = { version = "0.3", optional = true }
 [dev-dependencies]
 env_logger = "0.11"
 tokio = { version = "1", features = ["macros"] }
+libc = "0.2"
 
 
 [features]
