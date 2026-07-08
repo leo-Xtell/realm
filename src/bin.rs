@@ -185,10 +185,15 @@ async fn serve(endpoints: Vec<EndpointInfo>, reloadable: bool) -> Action {
         {
             use tokio::signal::unix::{signal, SignalKind};
             let mut hangup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
-            tokio::select! {
-                _ = join_all(workers) => Action::Shutdown,
+            let action = tokio::select! {
+                _ = join_all(&mut workers) => Action::Shutdown,
                 _ = hangup.recv() => Action::Reload,
+            };
+            for worker in &workers {
+                worker.abort();
             }
+            join_all(workers).await;
+            action
         }
         #[cfg(not(unix))]
         {
