@@ -189,10 +189,16 @@ async fn serve(endpoints: Vec<EndpointInfo>, reloadable: bool) -> Action {
                 _ = join_all(&mut workers) => Action::Shutdown,
                 _ = hangup.recv() => Action::Reload,
             };
-            for worker in &workers {
-                worker.abort();
+            if let Action::Reload = action {
+                for worker in &workers {
+                    worker.abort();
+                }
+                for worker in workers {
+                    if !worker.is_finished() {
+                        let _ = worker.await;
+                    }
+                }
             }
-            join_all(workers).await;
             action
         }
         #[cfg(not(unix))]
