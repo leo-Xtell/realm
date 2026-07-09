@@ -13,14 +13,15 @@ use super::proxy;
 #[cfg(feature = "transport")]
 use super::transport;
 
-use crate::trick::Ref;
+use std::sync::Arc;
+
 use crate::endpoint::{RemoteAddr, ConnectOpts};
 #[allow(unused)]
 pub async fn connect_and_relay(
     mut local: TcpStream,
-    raddr: Ref<RemoteAddr>,
-    conn_opts: Ref<ConnectOpts>,
-    extra_raddrs: Ref<Vec<RemoteAddr>>,
+    raddr: Arc<RemoteAddr>,
+    conn_opts: Arc<ConnectOpts>,
+    extra_raddrs: Arc<Vec<RemoteAddr>>,
 ) -> Result<()> {
     let ConnectOpts {
         #[cfg(feature = "proxy")]

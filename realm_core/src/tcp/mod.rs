@@ -14,9 +14,9 @@ mod proxy;
 mod transport;
 
 use std::io::{ErrorKind, Result};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::trick::Ref;
 use crate::endpoint::{BindOpts, Endpoint};
 
 use middle::connect_and_relay;
@@ -53,9 +53,15 @@ pub async fn run_tcp(endpoint: Endpoint) -> Result<()> {
         extra_raddrs,
     } = endpoint;
 
-    let raddr = Ref::new(&raddr);
-    let conn_opts = Ref::new(&conn_opts);
-    let extra_raddrs = Ref::new(&extra_raddrs);
+    // Shared per-connection state must be reference-counted, not a raw `Ref`
+    // into this stack frame: on reload `run_tcp` is aborted and its frame is
+    // freed while detached relay tasks may still be running, so a `Ref` would
+    // dangle (use-after-free -> SIGSEGV). `Arc` keeps the data alive until the
+    // last in-flight relay finishes; the tasks themselves are still killed by
+    // the runtime drop on reload, so the brutal-drop guarantee is unchanged.
+    let raddr = Arc::new(raddr);
+    let conn_opts = Arc::new(conn_opts);
+    let extra_raddrs = Arc::new(extra_raddrs);
 
     let lis = bind_with_retry(&laddr, bind_opts).await?;
     let keepalive = socket::keepalive::build(&conn_opts);
@@ -81,10 +87,14 @@ pub async fn run_tcp(endpoint: Endpoint) -> Result<()> {
             SockRef::from(&local).set_tcp_keepalive(kpa)?;
         }
 
+        let raddr = Arc::clone(&raddr);
+        let conn_opts = Arc::clone(&conn_opts);
+        let extra_raddrs = Arc::clone(&extra_raddrs);
         tokio::spawn(async move {
+            let log_raddr = Arc::clone(&raddr);
             match connect_and_relay(local, raddr, conn_opts, extra_raddrs).await {
-                Ok(..) => log::debug!("[tcp]{} => {}, finish", addr, raddr.as_ref()),
-                Err(e) => log::error!("[tcp]{} => {}, error: {}", addr, raddr.as_ref(), e),
+                Ok(..) => log::debug!("[tcp]{} => {}, finish", addr, log_raddr.as_ref()),
+                Err(e) => log::error!("[tcp]{} => {}, error: {}", addr, log_raddr.as_ref(), e),
             }
         });
     }

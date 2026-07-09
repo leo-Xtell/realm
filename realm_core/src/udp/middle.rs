@@ -6,7 +6,6 @@ use tokio::net::UdpSocket;
 use super::SockMap;
 use super::{socket, batched};
 
-use crate::trick::Ref;
 use crate::time::timeoutfut;
 use crate::dns::resolve_addr;
 use crate::endpoint::{RemoteAddr, ConnectOpts};
@@ -107,26 +106,34 @@ mod registry {
 }
 
 pub async fn associate_and_relay(
-    lis: Ref<UdpSocket>,
-    rname: Ref<RemoteAddr>,
-    conn_opts: Ref<ConnectOpts>,
-    sockmap: Ref<SockMap>,
+    lis: &Arc<UdpSocket>,
+    rname: &Arc<RemoteAddr>,
+    conn_opts: &Arc<ConnectOpts>,
+    sockmap: &Arc<SockMap>,
 ) -> Result<()> {
     let mut registry = Registry::new(batched::MAX_PACKETS);
 
     loop {
-        registry.batched_recv_on(&lis).await?;
+        registry.batched_recv_on(lis).await?;
         log::debug!("[udp]entry batched recvfrom[{}]", registry.count());
-        let raddr = resolve_addr(&rname).await?.iter().next().unwrap();
-        log::debug!("[udp]{} resolved as {}", *rname, raddr);
+        let raddr = resolve_addr(rname).await?.iter().next().unwrap();
+        log::debug!("[udp]{} resolved as {}", rname.as_ref(), raddr);
 
         registry.group_by_addr();
         for pkts in registry.group_iter() {
             let laddr = pkts[0].addr.clone().into();
             let rsock = sockmap.find_or_insert(&laddr, || {
-                let s = Arc::new(socket::associate(&raddr, &conn_opts)?);
-                tokio::spawn(send_back(lis, laddr, s.clone(), conn_opts, sockmap));
-                log::info!("[udp]new association {} => {} as {}", laddr, *rname, raddr);
+                let s = Arc::new(socket::associate(&raddr, conn_opts)?);
+                // Clone the Arcs into the detached send_back task so the
+                // listener/opts/sockmap outlive a reload that aborts run_udp.
+                tokio::spawn(send_back(
+                    Arc::clone(lis),
+                    laddr,
+                    s.clone(),
+                    Arc::clone(conn_opts),
+                    Arc::clone(sockmap),
+                ));
+                log::info!("[udp]new association {} => {} as {}", laddr, rname.as_ref(), raddr);
                 Result::Ok(s)
             })?;
             let raddr: SockAddrStore = raddr.into();
@@ -136,11 +143,11 @@ pub async fn associate_and_relay(
 }
 
 async fn send_back(
-    lsock: Ref<UdpSocket>,
+    lsock: Arc<UdpSocket>,
     laddr: SocketAddr,
     rsock: Arc<UdpSocket>,
-    conn_opts: Ref<ConnectOpts>,
-    sockmap: Ref<SockMap>,
+    conn_opts: Arc<ConnectOpts>,
+    sockmap: Arc<SockMap>,
 ) {
     let mut registry = Registry::new(batched::MAX_PACKETS);
     let timeout = conn_opts.associate_timeout;

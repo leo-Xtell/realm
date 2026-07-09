@@ -6,8 +6,8 @@ mod middle;
 mod batched;
 
 use std::io::Result;
+use std::sync::Arc;
 
-use crate::trick::Ref;
 use crate::endpoint::Endpoint;
 
 use sockmap::SockMap;
@@ -23,16 +23,18 @@ pub async fn run_udp(endpoint: Endpoint) -> Result<()> {
         ..
     } = endpoint;
 
-    let sockmap = SockMap::new();
-
     let lis = socket::bind(&laddr, bind_opts).unwrap_or_else(|e| panic!("[udp]failed to bind {}: {}", laddr, e));
 
-    let lis = Ref::new(&lis);
-    let raddr = Ref::new(&raddr);
-    let conn_opts = Ref::new(&conn_opts);
-    let sockmap = Ref::new(&sockmap);
+    // Reference-counted rather than a raw `Ref` into this frame: reload aborts
+    // `run_udp` and frees the frame while detached `send_back` tasks (spawned
+    // per association) may still hold these, so a `Ref` would dangle. `Arc`
+    // keeps the listener/opts/sockmap alive until the last `send_back` exits.
+    let lis = Arc::new(lis);
+    let raddr = Arc::new(raddr);
+    let conn_opts = Arc::new(conn_opts);
+    let sockmap = Arc::new(SockMap::new());
     loop {
-        if let Err(e) = associate_and_relay(lis, raddr, conn_opts, sockmap).await {
+        if let Err(e) = associate_and_relay(&lis, &raddr, &conn_opts, &sockmap).await {
             log::error!("[udp]error: {}", e);
         }
     }
